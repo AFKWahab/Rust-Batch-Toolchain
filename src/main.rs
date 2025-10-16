@@ -67,24 +67,26 @@ impl CmdSession {
     }
 }
 
-// Look through every line, if it starts with a colon, it's a label, so we take its index and save the string to it with a hashmap
+// Scan labels (case-insensitive)
 fn build_label_map(lines: &[&str]) -> HashMap<String, usize> {
     let mut map = HashMap::new();
     for (i, line) in lines.iter().enumerate() {
         let t = line.trim();
         if t.starts_with(':') && t.len() > 1 {
-            // label is everything after the leading ':'. We lowercase it for case-insensitive matching
-            map.insert(t[1..].trim().to_string().to_lowercase(), i);
+            map.insert(t[1..].trim().to_lowercase(), i);
         }
     }
     map
 }
 
-fn handle_return_or_terminate(lines_len: usize, call_stack: &mut Vec<Frame>) -> usize {
+/// Helper: unwind the current context at EOF.
+/// Returns Some(next_pc) when returning to a caller,
+/// or None when we should end the script (top-level EOF).
+fn leave_context(call_stack: &mut Vec<Frame>) -> Option<usize> {
     if let Some(frame) = call_stack.pop() {
-        frame.return_pc
+        Some(frame.return_pc) // implicit "GOTO :EOF" from subroutine
     } else {
-        lines_len // end script
+        None // no caller: end script
     }
 }
 
@@ -95,18 +97,33 @@ fn main() -> io::Result<()> {
 
     // Pre-scan labels for GOTO
     let labels = build_label_map(&lines);
+
     // Start persistent cmd session
-
     let mut session = CmdSession::start()?;
-    let mut pc = 0usize;
+    let mut pc: usize = 0;
     let mut call_stack: Vec<Frame> = Vec::new();
-    let mut last_exit_code: i32 = 0;
+    let mut _last_exit_code: i32 = 0;
 
-    while pc < lines.len() {
+    'run: loop {
+        // --- EOF unwinding: while pc is out of bounds, keep returning to callers.
+        while pc >= lines.len() {
+            match leave_context(&mut call_stack) {
+                Some(next_pc) => {
+                    pc = next_pc;
+                    // loop back to re-check bounds with the new pc
+                }
+                None => {
+                    // Truly top-level EOF → end script
+                    break 'run;
+                }
+            }
+        }
+
+        // Safe to fetch the current line now
         let raw = lines[pc];
         let line = raw.trim();
 
-        // Skip empty / REM lines
+        // Skip empty / comment lines
         if line.is_empty() || line.starts_with("REM") || line.starts_with("::") {
             pc += 1;
             continue;
@@ -118,8 +135,7 @@ fn main() -> io::Result<()> {
             continue;
         }
 
-        /* FROM HERE AND DOWNARDS UNTIL THE 'END CALL' COMMENT, we are handling the call stack */
-        // Handle call_stack, by saving current line, in the Vec<Frame>, and then jumping to the line
+        // ---- CALL :label
         if let Some(rest) = line.strip_prefix("CALL ") {
             let label = rest.trim().trim_start_matches(':').to_lowercase();
             if let Some(&target) = labels.get(&label) {
@@ -128,7 +144,7 @@ fn main() -> io::Result<()> {
                     args: None,
                     locals: None,
                 });
-                pc = target; // jump return_pc: pc (next loop iteration will skip the ':' line)
+                pc = target; // jump to label line (next iter will skip the ':' line)
             } else {
                 eprintln!("CALL to unknown label: {label}");
                 break;
@@ -136,31 +152,35 @@ fn main() -> io::Result<()> {
             continue;
         }
 
-        // Handle EXIT /B [n]
+        // ---- EXIT /B [n]
         if let Some(rest) = line.strip_prefix("EXIT /B") {
-            let code = rest.trim().parse::<i32>().unwrap_or(0);
-            // Pop the current frame (if any)
-            pc = handle_return_or_terminate(lines.len(), &mut call_stack);
+            let _code: i32 = rest.trim().parse::<i32>().unwrap_or(0);
+            // Note: EXIT /B N sets ERRORLEVEL in real cmd; you can mirror in UI if desired.
+            match leave_context(&mut call_stack) {
+                Some(next_pc) => {
+                    pc = next_pc;
+                }
+                None => break, // end script
+            }
             continue;
         }
 
-        // Handle GOTO :EOF (return from subroutine or end script)
-        if line.trim().eq_ignore_ascii_case("GOTO :EOF") {
-            pc = handle_return_or_terminate(lines.len(), &mut call_stack);
+        // ---- GOTO :EOF (return or end script)
+        if line.eq_ignore_ascii_case("GOTO :EOF") {
+            match leave_context(&mut call_stack) {
+                Some(next_pc) => {
+                    pc = next_pc;
+                }
+                None => break, // end script
+            }
             continue;
         }
 
-        // Handle what happens if we run out of lines
-        // Ideally this would have the same behavior as GOTO :EOF or EXIT /B for the current batch context.
-
-        /*
-         * END CALL
-         */
-        // Handle GOTO locally by changing the program counter (don't send to cmd)
+        // ---- GOTO label
         if let Some(rest) = line.strip_prefix("GOTO ") {
             let label = rest.trim().to_lowercase();
             if let Some(&target) = labels.get(&label) {
-                pc = target; // jump to label line (next loop iteration will skip the ':' line)
+                pc = target; // jump to label line (next iter will skip ':' line)
             } else {
                 eprintln!("GOTO to unknown label: {label}");
                 break;
@@ -168,19 +188,16 @@ fn main() -> io::Result<()> {
             continue;
         }
 
-        // Everything else: run inside the persistent cmd
+        // ---- Execute everything else inside persistent cmd
         println!("Executing line {pc}: {raw}");
         let (out, code) = session.run(line)?;
         if !out.is_empty() {
             print!("{out}");
         }
         println!("(exit code: {code})");
+        _last_exit_code = code;
 
-        // If we run out of lines, handle it
-        // Either we have something left in the stack, and we put the PC to that, otherwise we have a top level termination ;)
-        if pc >= lines.len() {
-            pc = handle_return_or_terminate(lines.len(), &mut call_stack);
-        }
+        // Advance to next line; EOF unwinding happens at top of loop
         pc += 1;
     }
 
