@@ -45,7 +45,7 @@ pub fn run_debugger(
         // Check if we should stop at this line
         if ctx.should_stop_at(pc) {
             eprintln!(
-                "\n⏸️  Stopped at logical line {} (phys line {})",
+                "\nStopped at logical line {} (phys line {})",
                 pc,
                 ll.phys_start + 1
             );

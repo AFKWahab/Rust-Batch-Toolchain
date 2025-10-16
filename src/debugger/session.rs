@@ -12,7 +12,7 @@ pub struct CmdSession {
 impl CmdSession {
     pub fn start() -> io::Result<Self> {
         let mut child = Command::new("cmd")
-            .args(["/Q", "/K", "SETLOCAL EnableDelayedExpansion & PROMPT $G"])
+            .args(["/V:ON", "/Q", "/K", "PROMPT $G"]) // /V:ON enables delayed expansion
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()?;
@@ -28,6 +28,7 @@ impl CmdSession {
     }
 
     pub fn run(&mut self, cmd: &str) -> io::Result<(String, i32)> {
+        // Use !ERRORLEVEL! for delayed expansion (enabled with /V:ON)
         let wrapped = format!("{cmd} 2>&1 & echo {SENTINEL} !ERRORLEVEL!\r\n");
         self.stdin.write_all(wrapped.as_bytes())?;
         self.stdin.flush()?;
