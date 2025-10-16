@@ -73,8 +73,8 @@ fn build_label_map(lines: &[&str]) -> HashMap<String, usize> {
     for (i, line) in lines.iter().enumerate() {
         let t = line.trim();
         if t.starts_with(':') && t.len() > 1 {
-            // label is everything after the leading ':'
-            map.insert(t[1..].trim().to_string(), i);
+            // label is everything after the leading ':'. We lowercase it for case-insensitive matching
+            map.insert(t[1..].trim().to_string().to_lowercase(), i);
         }
     }
     map
@@ -113,8 +113,8 @@ fn main() -> io::Result<()> {
         /* FROM HERE AND DOWNARDS UNTIL THE 'END CALL' COMMENT, we are handling the call stack */
         // Handle call_stack, by saving current line, in the Vec<Frame>, and then jumping to the line
         if let Some(rest) = line.strip_prefix("CALL ") {
-            let label = rest.trim().trim_start_matches(':');
-            if let Some(&target) = labels.get(label) {
+            let label = rest.trim().trim_start_matches(':').to_lowercase();
+            if let Some(&target) = labels.get(&label) {
                 call_stack.push(Frame {
                     return_pc: pc + 1,
                     args: None,
@@ -129,8 +129,7 @@ fn main() -> io::Result<()> {
         }
 
         // Handle EXIT /B [n]
-        if let Some(rest) = line.strip_prefix("EXIT /B") {
-            let code = rest.trim().parse::<i32>().unwrap_or(0);
+        if line.strip_prefix("EXIT /B") {
             // Pop the current frame (if any)
             if let Some(frame) = call_stack.pop() {
                 pc = frame.return_pc;
@@ -158,8 +157,8 @@ fn main() -> io::Result<()> {
          */
         // Handle GOTO locally by changing the program counter (don't send to cmd)
         if let Some(rest) = line.strip_prefix("GOTO ") {
-            let label = rest.trim();
-            if let Some(&target) = labels.get(label) {
+            let label = rest.trim().to_lowercase();
+            if let Some(&target) = labels.get(&label) {
                 pc = target; // jump to label line (next loop iteration will skip the ':' line)
             } else {
                 eprintln!("GOTO to unknown label: {label}");
