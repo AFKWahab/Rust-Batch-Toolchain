@@ -40,7 +40,7 @@ This is my checklist of what's complete and what is left until i can reach a **B
 - [x] Label scanning (`:label`)
 - [x] `GOTO` handling
 - [x] `CALL :label` with `EXIT /B` / `GOTO :EOF` / EOF return
-- [ ] Jump target normalization (case-insensitive labels, allow spaces)
+- [x] Jump target normalization (case-insensitive labels, allow spaces)
 - [ ] Proper top-level termination (EOF with empty/non-empty call stack)
 - [ ] `CALL external.bat` (decide whether to intercept or delegate)
 
