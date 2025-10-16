@@ -129,7 +129,8 @@ fn main() -> io::Result<()> {
         }
 
         // Handle EXIT /B [n]
-        if line.strip_prefix("EXIT /B") {
+        if let Some(rest) = line.strip_prefix("EXIT /B") {
+            let code = rest.trim().parse::<i32>().unwrap_or(0);
             // Pop the current frame (if any)
             if let Some(frame) = call_stack.pop() {
                 pc = frame.return_pc;
