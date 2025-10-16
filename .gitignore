@@ -1,0 +1,46 @@
+# Compiled files and build artifacts
+/target/
+**/*.rs.bk
+
+# Cargo lock file for libraries (but keep for binaries)
+/Cargo.lock
+
+# Backup and temp files
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+
+# IDE / editor files
+.idea/
+.vscode/
+*.iml
+
+# OS-specific junk
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Icon?
+Desktop.ini
+
+# Rust tooling caches
+/.cargo/
+/rustfmt.toml.bk
+
+# Coverage / testing / profiling
+coverage/
+.profdata
+.profraw
+*.gcda
+*.gcno
+*.gcov
+
+# Build scripts or generated docs
+/target/
+doc/
+
+# Byproducts from `cargo test` or `cargo bench`
+*.out
+*.json
+*.txt
