@@ -80,6 +80,14 @@ fn build_label_map(lines: &[&str]) -> HashMap<String, usize> {
     map
 }
 
+fn handle_return_or_terminate(lines_len: usize, call_stack: &mut Vec<Frame>) -> usize {
+    if let Some(frame) = call_stack.pop() {
+        frame.return_pc
+    } else {
+        lines_len // end script
+    }
+}
+
 fn main() -> io::Result<()> {
     // Read the batch file
     let contents = fs::read_to_string("test.bat").expect("Could not read test.bat");
@@ -132,26 +140,18 @@ fn main() -> io::Result<()> {
         if let Some(rest) = line.strip_prefix("EXIT /B") {
             let code = rest.trim().parse::<i32>().unwrap_or(0);
             // Pop the current frame (if any)
-            if let Some(frame) = call_stack.pop() {
-                pc = frame.return_pc;
-            } else {
-                // Stack empty: top-level EXIT /B means end script
-                pc = lines.len();
-            }
+            pc = handle_return_or_terminate(lines.len(), &mut call_stack);
             continue;
         }
 
         // Handle GOTO :EOF (return from subroutine or end script)
         if line.trim().eq_ignore_ascii_case("GOTO :EOF") {
-            if let Some(frame) = call_stack.pop() {
-                // Return from subroutine
-                pc = frame.return_pc;
-            } else {
-                // Top-level: no caller left → end script
-                pc = lines.len();
-            }
+            pc = handle_return_or_terminate(lines.len(), &mut call_stack);
             continue;
         }
+
+        // Handle what happens if we run out of lines
+        // Ideally this would have the same behavior as GOTO :EOF or EXIT /B for the current batch context.
 
         /*
          * END CALL
@@ -176,6 +176,11 @@ fn main() -> io::Result<()> {
         }
         println!("(exit code: {code})");
 
+        // If we run out of lines, handle it
+        // Either we have something left in the stack, and we put the PC to that, otherwise we have a top level termination ;)
+        if pc >= lines.len() {
+            pc = handle_return_or_terminate(lines.len(), &mut call_stack);
+        }
         pc += 1;
     }
 
