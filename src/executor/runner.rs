@@ -11,6 +11,7 @@ pub fn run_debugger(
     labels_phys: &HashMap<String, usize>,
 ) -> io::Result<()> {
     let mut pc: usize = 0;
+    let mut step_depth: Option<usize> = None; // Track depth for StepOver
 
     'run: loop {
         // EOF unwinding
@@ -42,42 +43,91 @@ pub fn run_debugger(
             continue;
         }
 
+        // Check if this line starts a block construct
+        let is_block_start = line_upper.starts_with("IF ") || line_upper.starts_with("FOR ");
+
+        // Determine if we should stop at this line
+        let should_stop = match ctx.mode() {
+            RunMode::Continue => ctx.should_stop_at(pc),
+            RunMode::StepInto => true,
+            RunMode::StepOver => {
+                // Stop if we're at or above the original depth
+                if let Some(target_depth) = step_depth {
+                    ctx.call_stack.len() <= target_depth
+                } else {
+                    true
+                }
+            }
+            RunMode::StepOut => ctx.should_stop_at(pc),
+        };
+
         // Check if we should stop at this line
-        if ctx.should_stop_at(pc) {
+        if should_stop {
             eprintln!(
-                "\nStopped at logical line {} (phys line {})",
+                "\n🔍 Stopped at logical line {} (phys line {})",
                 pc,
                 ll.phys_start + 1
             );
             eprintln!("    {}", raw);
+
+            // If this is a block start, show the entire block
+            if is_block_start && ll.group_depth > 0 {
+                eprintln!("    [This is the start of a multi-line block]");
+            }
+
             ctx.print_call_stack(&pre.logical);
 
-            eprintln!("\nCommands: (c)ontinue, (n)ext/stepOver, (s)tepIn, (o)ut/stepOut, (b)reakpoint, (q)uit");
-            eprint!("> ");
-            io::stderr().flush()?;
+            'prompt: loop {
+                eprintln!("\nCommands: (c)ontinue, (n)ext/stepOver, (s)tepIn, (o)ut/stepOut, (b)reakpoint <line>, (q)uit");
+                eprint!("> ");
+                io::stderr().flush()?;
 
-            let mut input = String::new();
-            io::stdin().read_line(&mut input)?;
-            let cmd = input.trim();
+                let mut input = String::new();
+                io::stdin().read_line(&mut input)?;
+                let cmd = input.trim();
 
-            match cmd {
-                "c" | "continue" => ctx.handle_step_command("continue"),
-                "n" | "next" | "stepOver" => ctx.handle_step_command("stepOver"),
-                "s" | "stepIn" | "stepInto" => ctx.handle_step_command("stepInto"),
-                "o" | "out" | "stepOut" => ctx.handle_step_command("stepOut"),
-                "q" | "quit" => break 'run,
-                cmd if cmd.starts_with("b ") => {
-                    if let Ok(line_num) = cmd[2..].trim().parse::<usize>() {
-                        ctx.add_breakpoint(line_num);
+                match cmd {
+                    "c" | "continue" => {
+                        ctx.handle_step_command("continue");
+                        step_depth = None;
+                        break 'prompt;
+                    }
+                    "n" | "next" | "stepOver" => {
+                        ctx.handle_step_command("stepOver");
+                        step_depth = Some(ctx.call_stack.len());
+                        break 'prompt;
+                    }
+                    "s" | "stepIn" | "stepInto" => {
+                        ctx.handle_step_command("stepInto");
+                        step_depth = None;
+                        break 'prompt;
+                    }
+                    "o" | "out" | "stepOut" => {
+                        ctx.handle_step_command("stepOut");
+                        step_depth = None;
+                        break 'prompt;
+                    }
+                    "q" | "quit" => break 'run,
+                    cmd if cmd.starts_with("b ") => {
+                        if let Ok(line_num) = cmd[2..].trim().parse::<usize>() {
+                            ctx.add_breakpoint(line_num);
+                        } else {
+                            eprintln!("❌ Invalid line number");
+                        }
+                        // Don't break - re-prompt
+                    }
+                    "" => {
+                        // Empty input - step into by default
+                        ctx.handle_step_command("stepInto");
+                        step_depth = None;
+                        break 'prompt;
+                    }
+                    _ => {
+                        eprintln!("❓ Unknown command: {}", cmd);
+                        // Don't break - re-prompt
                     }
                 }
-                _ => eprintln!("Unknown command: {}", cmd),
             }
-        }
-
-        // After stepping once in StepOver/StepInto, revert to Continue mode
-        if matches!(ctx.mode(), RunMode::StepOver | RunMode::StepInto) {
-            ctx.set_mode(RunMode::Continue);
         }
 
         // PAUSE command
@@ -101,11 +151,6 @@ pub fn run_debugger(
 
             if let Some(&phys_target) = labels_phys.get(&label_key) {
                 let logical_target = pre.phys_to_logical[phys_target];
-
-                if ctx.mode() == RunMode::StepOver {
-                    eprintln!("\n📞 CALL to :{} (stepping over)", label_key);
-                    ctx.set_mode(RunMode::Continue);
-                }
 
                 ctx.call_stack.push(Frame {
                     return_pc: pc + 1,
@@ -179,15 +224,68 @@ pub fn run_debugger(
             continue;
         }
 
-        // Execute command
-        eprintln!(
-            "\n▶️  [Lines {}-{}] depth={} group={:?}",
-            ll.phys_start + 1,
-            ll.phys_end + 1,
-            ll.group_depth,
-            ll.group_id
-        );
-        eprintln!("    {}", raw);
+        // Handle block constructs (IF, FOR with parentheses)
+        if is_block_start && raw.contains('(') && !raw.contains(')') {
+            // This is the start of a multi-line block
+            // We need to collect all lines until the block closes
+            let mut block_lines = vec![raw.to_string()];
+            let mut block_pc = pc + 1;
+            let start_depth = ll.group_depth;
+
+            eprintln!("\n📦 Collecting block starting at line {}", pc);
+
+            // Collect all lines that are part of this block
+            while block_pc < pre.logical.len() {
+                let block_line = &pre.logical[block_pc];
+                block_lines.push(block_line.text.clone());
+
+                // Check if we've returned to the same depth or lower (block is complete)
+                if block_line.group_depth <= start_depth && block_line.text.contains(')') {
+                    break;
+                }
+                block_pc += 1;
+            }
+
+            // Execute the entire block as one command
+            let full_command = block_lines.join(" ");
+
+            if !should_stop {
+                eprintln!(
+                    "\n▶️  [Block Lines {}-{}] Executing block",
+                    ll.phys_start + 1,
+                    pre.logical[block_pc].phys_end + 1
+                );
+                eprintln!("    Full block: {}", full_command);
+            }
+
+            ctx.track_set_command(&full_command);
+
+            let (out, code) = ctx.run_command(&full_command)?;
+            if !out.trim().is_empty() {
+                print!("{}", out);
+            }
+
+            ctx.last_exit_code = code;
+            if !should_stop {
+                eprintln!("    └─ block exit code: {}", code);
+            }
+
+            // Skip to the end of the block
+            pc = block_pc + 1;
+            continue;
+        }
+
+        // Execute single-line command
+        if !should_stop {
+            eprintln!(
+                "\n▶️  [Lines {}-{}] depth={} group={:?}",
+                ll.phys_start + 1,
+                ll.phys_end + 1,
+                ll.group_depth,
+                ll.group_id
+            );
+            eprintln!("    {}", raw);
+        }
 
         ctx.track_set_command(&line);
 
@@ -222,7 +320,9 @@ pub fn run_debugger(
                 }
 
                 ctx.last_exit_code = code;
-                eprintln!("    └─ exit code: {}", code);
+                if !should_stop {
+                    eprintln!("    └─ exit code: {}", code);
+                }
             } else {
                 eprintln!("    ├─ Part {} skipped (condition failed)", i + 1);
             }

@@ -57,6 +57,37 @@ impl CmdSession {
         Ok(session)
     }
 
+    /// Check if a command needs multi-line input (has unclosed parentheses)
+    fn needs_continuation(cmd: &str) -> bool {
+        let mut paren_count = 0;
+        let mut in_quotes = false;
+        let mut escaped = false;
+
+        for ch in cmd.chars() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '^' {
+                escaped = true;
+                continue;
+            }
+            if ch == '"' {
+                in_quotes = !in_quotes;
+                continue;
+            }
+            if !in_quotes {
+                match ch {
+                    '(' => paren_count += 1,
+                    ')' => paren_count -= 1,
+                    _ => {}
+                }
+            }
+        }
+
+        paren_count > 0
+    }
+
     pub fn run(&mut self, cmd: &str) -> io::Result<(String, i32)> {
         // Special case for @echo off - it produces no output
         if cmd.trim().eq_ignore_ascii_case("@echo off")
@@ -68,85 +99,105 @@ impl CmdSession {
             return Ok((String::new(), 0));
         }
 
-        // For debugging problematic commands
-        let debug_this = cmd.contains("set /a") || cmd.contains("COUNTER");
+        let debug_this = cmd.contains("set /a") || cmd.contains("COUNTER") || cmd.contains("if ");
 
         if debug_this {
             eprintln!("DEBUG: About to execute: '{}'", cmd);
         }
 
-        // Send the command followed by our sentinel
-        // Use multiple newlines to ensure the echo command is on its own line
-        self.stdin.write_all(cmd.as_bytes())?;
-        self.stdin.write_all(b"\r\n")?;
-        self.stdin.flush()?;
+        // Check if this is a multi-line command
+        let is_multiline = Self::needs_continuation(cmd);
 
-        // Small delay to ensure command completes
-        std::thread::sleep(Duration::from_millis(50));
+        if is_multiline {
+            eprintln!("DEBUG: Detected multi-line command");
+            // For multi-line commands, we need to send them in a special way
+            // Write to a temporary batch file and execute it
+            let temp_batch = "__temp_cmd__.bat";
+            std::fs::write(temp_batch, format!("@echo off\r\n{}\r\n", cmd))
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
-        // Now send the sentinel
+            // Execute the temp batch file
+            self.stdin
+                .write_all(format!("call {}\r\n", temp_batch).as_bytes())?;
+            self.stdin.flush()?;
+
+            // Clean up
+            std::thread::sleep(Duration::from_millis(200));
+            self.stdin
+                .write_all(format!("del {} >nul 2>&1\r\n", temp_batch).as_bytes())?;
+            self.stdin.flush()?;
+        } else {
+            // Send the command normally
+            self.stdin.write_all(cmd.as_bytes())?;
+            self.stdin.write_all(b"\r\n")?;
+            self.stdin.flush()?;
+        }
+
+        // Give the command time to execute
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Send echo command to force a newline and get the exit code
+        self.stdin.write_all(b"echo.\r\n")?; // Force a blank line first
         let sentinel_cmd = format!("echo {}_%errorlevel%_END\r\n", SENTINEL);
         self.stdin.write_all(sentinel_cmd.as_bytes())?;
         self.stdin.flush()?;
 
         let mut output = String::new();
         let mut exit_code = 0;
-        let timeout = Duration::from_secs(3);
+        let timeout = Duration::from_secs(5);
         let start = Instant::now();
-        let mut lines_read = 0;
+        let mut found_blank = false;
+        let mut collecting = true;
 
         loop {
             // Check timeout
             if start.elapsed() > timeout {
-                eprintln!("WARNING: Command timed out after 3 seconds");
+                eprintln!("WARNING: Command timed out after 5 seconds");
                 eprintln!("  Command was: {}", cmd);
                 eprintln!("  Output collected so far: '{}'", output.trim());
-                // Return what we have with a non-zero exit code
                 return Ok((output, 1));
             }
 
             let mut line = String::new();
             match self.stdout.read_line(&mut line) {
                 Ok(0) => {
-                    if debug_this {
-                        eprintln!("DEBUG: EOF reached");
-                    }
-                    // Give it another chance with a small delay
-                    std::thread::sleep(Duration::from_millis(100));
+                    std::thread::sleep(Duration::from_millis(50));
                     continue;
                 }
                 Ok(_) => {
-                    lines_read += 1;
                     let trimmed = line.trim();
 
                     if debug_this {
-                        eprintln!("DEBUG: Line {}: '{}'", lines_read, trimmed);
+                        eprintln!("DEBUG: Read line: '{}'", trimmed);
                     }
 
-                    // Check if this is our sentinel
+                    // Check for our sentinel
                     if trimmed.starts_with(SENTINEL) && trimmed.ends_with("_END") {
-                        // Extract error code
-                        let prefix_len = SENTINEL.len() + 1; // +1 for underscore
-                        let suffix_len = 4; // "_END"
+                        let prefix_len = SENTINEL.len() + 1;
+                        let suffix_len = 4;
                         if trimmed.len() > prefix_len + suffix_len {
                             let code_str = &trimmed[prefix_len..trimmed.len() - suffix_len];
                             if let Ok(code) = code_str.parse::<i32>() {
                                 exit_code = code;
                             }
                         }
-                        if debug_this {
-                            eprintln!("DEBUG: Found sentinel, exit code: {}", exit_code);
-                        }
                         break;
-                    } else if !trimmed.is_empty() {
-                        // Regular output
+                    }
+
+                    // Look for the blank line we inserted
+                    if trimmed.is_empty() && !found_blank {
+                        found_blank = true;
+                        collecting = false;
+                        continue;
+                    }
+
+                    // Collect output only before the blank line
+                    if collecting && !trimmed.is_empty() {
                         output.push_str(&line);
                     }
                 }
                 Err(e) => {
-                    if debug_this {
-                        eprintln!("DEBUG: Read error: {}", e);
-                    }
+                    eprintln!("DEBUG: Read error: {}", e);
                     return Err(e);
                 }
             }
