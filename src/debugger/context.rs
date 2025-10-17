@@ -6,6 +6,7 @@ use std::io;
 
 pub struct DebugContext {
     session: CmdSession,
+    /// Global variables (when not in a SETLOCAL scope)
     pub variables: HashMap<String, String>,
     pub call_stack: Vec<Frame>,
     pub last_exit_code: i32,
@@ -39,6 +40,50 @@ impl DebugContext {
         self.mode = mode;
     }
 
+    /// Handle SETLOCAL command - creates a new variable scope
+    pub fn handle_setlocal(&mut self) {
+        if let Some(frame) = self.call_stack.last_mut() {
+            frame.has_setlocal = true;
+            eprintln!("📦 SETLOCAL - created new variable scope");
+        }
+    }
+
+    /// Handle ENDLOCAL command - restores previous variable scope
+    pub fn handle_endlocal(&mut self) {
+        if let Some(frame) = self.call_stack.last_mut() {
+            if frame.has_setlocal {
+                frame.locals.clear();
+                frame.has_setlocal = false;
+                eprintln!("📤 ENDLOCAL - restored previous scope");
+            }
+        }
+    }
+
+    /// Get all variables visible in current scope (merges global + local)
+    pub fn get_visible_variables(&self) -> HashMap<String, String> {
+        let mut visible = self.variables.clone();
+
+        // Overlay local variables from current frame if SETLOCAL is active
+        if let Some(frame) = self.call_stack.last() {
+            if frame.has_setlocal {
+                visible.extend(frame.locals.clone());
+            }
+        }
+
+        visible
+    }
+
+    /// Get variables for a specific stack frame (for DAP)
+    pub fn get_frame_variables(&self, frame_index: usize) -> HashMap<String, String> {
+        if frame_index < self.call_stack.len() {
+            let frame = &self.call_stack[frame_index];
+            if frame.has_setlocal {
+                return frame.locals.clone();
+            }
+        }
+        HashMap::new()
+    }
+
     pub fn print_call_stack(&self, logical: &[LogicalLine]) {
         if self.call_stack.is_empty() {
             eprintln!("\n=== Call Stack: <empty - top level> ===");
@@ -50,11 +95,17 @@ impl DebugContext {
             let return_line = frame.return_pc.saturating_sub(1);
             if return_line < logical.len() {
                 let line = &logical[return_line];
+                let scope_info = if frame.has_setlocal {
+                    format!(" [SETLOCAL: {} vars]", frame.locals.len())
+                } else {
+                    String::new()
+                };
                 eprintln!(
-                    "  #{}: return to logical line {} (phys line {})",
+                    "  #{}: return to logical line {} (phys line {}){}",
                     i,
                     frame.return_pc,
-                    line.phys_start + 1
+                    line.phys_start + 1,
+                    scope_info
                 );
             } else {
                 eprintln!("  #{}: return to logical line {}", i, frame.return_pc);
@@ -64,11 +115,12 @@ impl DebugContext {
     }
 
     pub fn print_variables(&self) {
-        if self.variables.is_empty() {
+        let visible = self.get_visible_variables();
+        if visible.is_empty() {
             return;
         }
         eprintln!("\n=== Tracked Variables ===");
-        let mut vars: Vec<_> = self.variables.iter().collect();
+        let mut vars: Vec<_> = visible.iter().collect();
         vars.sort_by_key(|(k, _)| *k);
         for (key, val) in vars {
             eprintln!("  {}={}", key, val);
@@ -76,13 +128,46 @@ impl DebugContext {
         eprintln!();
     }
 
+    /// Track SET commands - stores in appropriate scope
     pub fn track_set_command(&mut self, line: &str) {
-        let line_upper = line.to_uppercase();
-        if line_upper.starts_with("SET ") {
-            let rest = &line[4..].trim();
-            if let Some(eq_pos) = rest.find('=') {
-                let key = rest[..eq_pos].trim().to_string();
-                let val = rest[eq_pos + 1..].trim().to_string();
+        let l = line.trim_start();
+        if !l.to_uppercase().starts_with("SET ") {
+            return;
+        }
+
+        let mut rest = l[3..].trim_start();
+
+        // Optional switches: /A (arithmetic) or /P (prompt)
+        if let Some(r) = rest.strip_prefix("/A") {
+            rest = r.trim_start();
+        } else if let Some(r) = rest.strip_prefix("/a") {
+            rest = r.trim_start();
+        } else if let Some(r) = rest.strip_prefix("/P") {
+            rest = r.trim_start();
+        } else if let Some(r) = rest.strip_prefix("/p") {
+            rest = r.trim_start();
+        }
+
+        // Handle quoted SET "VAR=VAL"
+        let rest = rest.trim();
+        let rest = if rest.starts_with('"') && rest.ends_with('"') && rest.len() >= 2 {
+            &rest[1..rest.len() - 1]
+        } else {
+            rest
+        };
+
+        if let Some(eq_pos) = rest.find('=') {
+            let key = rest[..eq_pos].trim().to_string();
+            let val = rest[eq_pos + 1..].trim().to_string();
+
+            if !key.is_empty() {
+                // Store in local scope if SETLOCAL is active, otherwise global
+                if let Some(frame) = self.call_stack.last_mut() {
+                    if frame.has_setlocal {
+                        frame.locals.insert(key, val);
+                        return;
+                    }
+                }
                 self.variables.insert(key, val);
             }
         }

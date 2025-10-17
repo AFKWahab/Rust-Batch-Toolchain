@@ -12,8 +12,9 @@ pub struct CmdSession {
 
 impl CmdSession {
     pub fn start() -> io::Result<Self> {
+        // Enable delayed expansion globally so !VAR! works as expected.
         let mut child = Command::new("cmd")
-            .args(["/Q"]) // Just quiet mode
+            .args(["/V:ON", "/Q"]) // <— important change
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()?;
@@ -88,6 +89,28 @@ impl CmdSession {
         paren_count > 0
     }
 
+    /// Execute a multi-line block as a *real batch file* preserving CRLFs and batch parsing rules.
+    pub fn run_batch_block(&mut self, lines: &[String]) -> io::Result<(String, i32)> {
+        let temp_batch = "__temp_block__.bat";
+
+        // Preserve original line structure; batch parsing requires CRLF boundaries.
+        let mut body = String::from("@echo off\r\n");
+        for l in lines {
+            body.push_str(l);
+            body.push_str("\r\n");
+        }
+
+        std::fs::write(temp_batch, body).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        // Execute via CALL so the session stays alive
+        let (out, code) = self.run(&format!("call {}", temp_batch))?;
+
+        // Best-effort cleanup; ignore errors
+        let _ = self.run(&format!("del {} >nul 2>&1", temp_batch));
+
+        Ok((out, code))
+    }
+
     pub fn run(&mut self, cmd: &str) -> io::Result<(String, i32)> {
         // Special case for @echo off - it produces no output
         if cmd.trim().eq_ignore_ascii_case("@echo off")
@@ -105,13 +128,12 @@ impl CmdSession {
             eprintln!("DEBUG: About to execute: '{}'", cmd);
         }
 
-        // Check if this is a multi-line command
+        // Check if this is a multi-line command (rare for single-line path)
         let is_multiline = Self::needs_continuation(cmd);
 
         if is_multiline {
             eprintln!("DEBUG: Detected multi-line command");
-            // For multi-line commands, we need to send them in a special way
-            // Write to a temporary batch file and execute it
+            // Write to a temporary batch file and execute it to preserve semantics
             let temp_batch = "__temp_cmd__.bat";
             std::fs::write(temp_batch, format!("@echo off\r\n{}\r\n", cmd))
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;

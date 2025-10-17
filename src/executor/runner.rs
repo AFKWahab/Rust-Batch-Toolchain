@@ -5,6 +5,50 @@ use crate::parser::{
 use std::collections::HashMap;
 use std::io::{self, Write};
 
+/// Compute net parenthesis delta for a line, honoring quotes and ^ escapes
+fn paren_delta(line: &str) -> i32 {
+    let mut delta = 0i32;
+    let mut in_quotes = false;
+    let mut escaped = false;
+
+    for ch in line.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '^' {
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            in_quotes = !in_quotes;
+            continue;
+        }
+        if !in_quotes {
+            match ch {
+                '(' => delta += 1,
+                ')' => delta -= 1,
+                _ => {}
+            }
+        }
+    }
+    delta
+}
+
+/// Minimal expander for %1..%9 and %~1..%~9 (strip surrounding quotes)
+fn expand_positional_args(mut text: String, args: &[String]) -> String {
+    // Replace higher numbers first to avoid %10 matching %1
+    for i in (1..=9).rev() {
+        let idx = i - 1;
+        let val = args.get(idx).cloned().unwrap_or_default();
+        let unquoted = val.trim_matches('"').to_string();
+
+        text = text.replace(&format!("%~{}", i), &unquoted);
+        text = text.replace(&format!("%{}", i), &val);
+    }
+    text
+}
+
 pub fn run_debugger(
     ctx: &mut DebugContext,
     pre: &PreprocessResult,
@@ -43,15 +87,39 @@ pub fn run_debugger(
             continue;
         }
 
-        // Check if this line starts a block construct
-        let is_block_start = line_upper.starts_with("IF ") || line_upper.starts_with("FOR ");
+        // Handle SETLOCAL
+        if line_upper.starts_with("SETLOCAL") {
+            ctx.handle_setlocal();
+            let (out, code) = ctx.run_command(&line)?;
+            if !out.trim().is_empty() {
+                print!("{}", out);
+            }
+            ctx.last_exit_code = code;
+            pc += 1;
+            continue;
+        }
+
+        // Handle ENDLOCAL
+        if line_upper.starts_with("ENDLOCAL") {
+            ctx.handle_endlocal();
+            let (out, code) = ctx.run_command(&line)?;
+            if !out.trim().is_empty() {
+                print!("{}", out);
+            }
+            ctx.last_exit_code = code;
+            pc += 1;
+            continue;
+        }
+
+        // Detect potential block start (IF ... ( or FOR ... ()
+        let is_block_start = (line_upper.starts_with("IF ") || line_upper.starts_with("FOR "))
+            && paren_delta(raw) > 0;
 
         // Determine if we should stop at this line
         let should_stop = match ctx.mode() {
             RunMode::Continue => ctx.should_stop_at(pc),
             RunMode::StepInto => true,
             RunMode::StepOver => {
-                // Stop if we're at or above the original depth
                 if let Some(target_depth) = step_depth {
                     ctx.call_stack.len() <= target_depth
                 } else {
@@ -61,7 +129,7 @@ pub fn run_debugger(
             RunMode::StepOut => ctx.should_stop_at(pc),
         };
 
-        // Check if we should stop at this line
+        // Stop point UI
         if should_stop {
             eprintln!(
                 "\n🔍 Stopped at logical line {} (phys line {})",
@@ -70,8 +138,7 @@ pub fn run_debugger(
             );
             eprintln!("    {}", raw);
 
-            // If this is a block start, show the entire block
-            if is_block_start && ll.group_depth > 0 {
+            if is_block_start {
                 eprintln!("    [This is the start of a multi-line block]");
             }
 
@@ -114,7 +181,6 @@ pub fn run_debugger(
                         } else {
                             eprintln!("❌ Invalid line number");
                         }
-                        // Don't break - re-prompt
                     }
                     "" => {
                         // Empty input - step into by default
@@ -124,13 +190,12 @@ pub fn run_debugger(
                     }
                     _ => {
                         eprintln!("❓ Unknown command: {}", cmd);
-                        // Don't break - re-prompt
                     }
                 }
             }
         }
 
-        // PAUSE command
+        // PAUSE command (interactive)
         if line_upper == "PAUSE" {
             eprintln!("\n⏸  Press Enter to continue...");
             let mut buf = String::new();
@@ -139,24 +204,20 @@ pub fn run_debugger(
             continue;
         }
 
-        // CALL :label
+        // CALL :label [args...]
         if line_upper.starts_with("CALL ") {
             let rest = &line[5..].trim();
-            let label_key = rest
-                .trim_start_matches(':')
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .to_lowercase();
+
+            // Use shlex to split once: first token is label, remaining tokens are args (quotes preserved)
+            let mut lexer = shlex::Shlex::new(rest);
+            let first = lexer.next().unwrap_or_default();
+            let label_key = first.trim_start_matches(':').to_lowercase();
+            let args: Vec<String> = lexer.collect();
 
             if let Some(&phys_target) = labels_phys.get(&label_key) {
                 let logical_target = pre.phys_to_logical[phys_target];
 
-                ctx.call_stack.push(Frame {
-                    return_pc: pc + 1,
-                    args: None,
-                    locals: None,
-                });
+                ctx.call_stack.push(Frame::new(pc + 1, Some(args)));
 
                 eprintln!(
                     "\n📞 CALL to :{} (jumping to logical line {})",
@@ -225,53 +286,37 @@ pub fn run_debugger(
         }
 
         // Handle block constructs (IF, FOR with parentheses)
-        if is_block_start && raw.contains('(') && !raw.contains(')') {
-            // This is the start of a multi-line block
-            // We need to collect all lines until the block closes
+        if is_block_start {
             let mut block_lines = vec![raw.to_string()];
             let mut block_pc = pc + 1;
-            let start_depth = ll.group_depth;
+            let mut balance = paren_delta(raw);
 
             eprintln!("\n📦 Collecting block starting at line {}", pc);
 
-            // Collect all lines that are part of this block
-            while block_pc < pre.logical.len() {
-                let block_line = &pre.logical[block_pc];
-                block_lines.push(block_line.text.clone());
-
-                // Check if we've returned to the same depth or lower (block is complete)
-                if block_line.group_depth <= start_depth && block_line.text.contains(')') {
-                    break;
-                }
+            while balance > 0 && block_pc < pre.logical.len() {
+                let b = &pre.logical[block_pc];
+                block_lines.push(b.text.clone());
+                balance += paren_delta(&b.text);
                 block_pc += 1;
             }
 
-            // Execute the entire block as one command
-            let full_command = block_lines.join(" ");
-
-            if !should_stop {
-                eprintln!(
-                    "\n▶️  [Block Lines {}-{}] Executing block",
-                    ll.phys_start + 1,
-                    pre.logical[block_pc].phys_end + 1
-                );
-                eprintln!("    Full block: {}", full_command);
+            // Expand positional args if inside a subroutine
+            if let Some(frame) = ctx.call_stack.last() {
+                if let Some(a) = &frame.args {
+                    for l in &mut block_lines {
+                        *l = expand_positional_args(l.clone(), a);
+                    }
+                }
             }
 
-            ctx.track_set_command(&full_command);
-
-            let (out, code) = ctx.run_command(&full_command)?;
+            let (out, code) = ctx.session_mut().run_batch_block(&block_lines)?;
             if !out.trim().is_empty() {
                 print!("{}", out);
             }
-
             ctx.last_exit_code = code;
-            if !should_stop {
-                eprintln!("    └─ block exit code: {}", code);
-            }
+            eprintln!("    └─ block exit code: {}", code);
 
-            // Skip to the end of the block
-            pc = block_pc + 1;
+            pc = block_pc;
             continue;
         }
 
@@ -286,8 +331,6 @@ pub fn run_debugger(
             );
             eprintln!("    {}", raw);
         }
-
-        ctx.track_set_command(&line);
 
         let parts = split_composite_command(&line);
 
@@ -310,11 +353,20 @@ pub fn run_debugger(
             };
 
             if should_execute {
-                if parts.len() > 1 {
-                    eprintln!("    ├─ Part {}: {}", i + 1, part.text);
+                let mut exec_text = part.text.clone();
+                if let Some(frame) = ctx.call_stack.last() {
+                    if let Some(a) = &frame.args {
+                        exec_text = expand_positional_args(exec_text, a);
+                    }
                 }
 
-                let (out, code) = ctx.run_command(&part.text)?;
+                if parts.len() > 1 {
+                    eprintln!("    ├─ Part {}: {}", i + 1, exec_text);
+                }
+
+                ctx.track_set_command(&exec_text);
+
+                let (out, code) = ctx.run_command(&exec_text)?;
                 if !out.trim().is_empty() {
                     print!("{}", out);
                 }

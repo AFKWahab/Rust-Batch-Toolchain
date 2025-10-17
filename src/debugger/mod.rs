@@ -7,13 +7,28 @@ pub use context::DebugContext;
 pub use session::CmdSession;
 pub use stepping::RunMode;
 
-// Re-export Frame for use in executor
+use std::collections::HashMap;
+
+/// Represents a single stack frame with its own variable scope
+#[derive(Debug, Clone)]
 pub struct Frame {
     pub return_pc: usize,
-    #[allow(dead_code)]
     pub args: Option<Vec<String>>,
-    #[allow(dead_code)]
-    pub locals: Option<Vec<String>>,
+    /// Local variables for this frame (created by SETLOCAL)
+    pub locals: HashMap<String, String>,
+    /// Whether this frame has SETLOCAL active
+    pub has_setlocal: bool,
+}
+
+impl Frame {
+    pub fn new(return_pc: usize, args: Option<Vec<String>>) -> Self {
+        Self {
+            return_pc,
+            args,
+            locals: HashMap::new(),
+            has_setlocal: false,
+        }
+    }
 }
 
 /// Helper: unwind the current context at EOF.
