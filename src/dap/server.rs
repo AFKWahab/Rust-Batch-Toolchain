@@ -1,13 +1,14 @@
 use super::protocol::{DapMessage, DapMessageContent};
 use crate::debugger::{CmdSession, DebugContext, RunMode};
-use crate::executor; // <-- ADD this import
+use crate::executor;
 use crate::parser::{self, PreprocessResult};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{self, BufRead, Read, Write};
+use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration; // <-- ADD this import
+use std::time::Duration;
 
 pub struct DapServer {
     seq: u64,
@@ -15,6 +16,15 @@ pub struct DapServer {
     preprocessed: Option<PreprocessResult>,
     labels: Option<HashMap<String, usize>>,
     breakpoints: HashMap<String, Vec<usize>>,
+    event_sender: Option<Sender<DapEvent>>,
+    program_path: Option<String>, // ADDED
+}
+
+// Events that the execution thread can send back
+#[derive(Debug)]
+enum DapEvent {
+    Stopped { reason: String, line: usize },
+    Exited { exit_code: i32 },
 }
 
 impl DapServer {
@@ -25,6 +35,8 @@ impl DapServer {
             preprocessed: None,
             labels: None,
             breakpoints: HashMap::new(),
+            event_sender: None,
+            program_path: None, // ADDED
         }
     }
 
@@ -66,11 +78,19 @@ impl DapServer {
     fn send_message(&self, msg: &DapMessage) {
         let json = serde_json::to_string(msg).unwrap();
         let content_length = json.len();
-        let stdout = io::stdout();
-        let mut handle = stdout.lock();
-        let _ = writeln!(handle, "Content-Length: {}\r\n", content_length);
-        let _ = writeln!(handle, "{}", json);
-        let _ = handle.flush();
+
+        // Write to stdout with proper protocol format
+        // CRITICAL: Must be exactly "Content-Length: {len}\r\n\r\n{json}"
+        let output = format!("Content-Length: {}\r\n\r\n{}", content_length, json);
+
+        print!("{}", output);
+
+        // MUST flush immediately
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+
+        // Debug log to stderr (won't interfere with DAP protocol)
+        eprintln!("📤 Sent {} bytes", content_length);
     }
 
     pub fn read_message(&self) -> Option<DapMessage> {
@@ -116,6 +136,10 @@ impl DapServer {
             "supportsSetVariable": false,
         });
         self.send_response(seq, command, true, Some(body));
+
+        // CRITICAL: Send initialized event after response
+        eprintln!("📋 Sending initialized event");
+        self.send_event("initialized".to_string(), None);
     }
 
     pub fn handle_launch(&mut self, seq: u64, command: String, args: Option<Value>) {
@@ -124,6 +148,9 @@ impl DapServer {
             .and_then(|v| v.get("program"))
             .and_then(|v| v.as_str())
             .unwrap_or("test.bat");
+
+        // STORE the program path
+        self.program_path = Some(program.to_string());
 
         eprintln!("🚀 Launching batch file: {}", program);
 
@@ -136,25 +163,26 @@ impl DapServer {
                 match CmdSession::start() {
                     Ok(session) => {
                         let mut ctx = DebugContext::new(session);
-                        ctx.set_mode(RunMode::Continue); // Start in continue mode
+                        ctx.set_mode(RunMode::StepInto);
 
                         let ctx_arc = Arc::new(Mutex::new(ctx));
                         self.context = Some(ctx_arc.clone());
                         self.preprocessed = Some(pre.clone());
                         self.labels = Some(labels_phys.clone());
 
-                        self.send_response(seq, command, true, None);
-                        self.send_event("initialized".to_string(), None);
+                        let (tx, rx) = channel();
+                        self.event_sender = Some(tx.clone());
 
-                        // IMPORTANT: Spawn execution thread
+                        self.send_response(seq, command, true, None);
+
                         thread::spawn(move || {
                             if let Err(e) = executor::run_debugger_dap(ctx_arc, &pre, &labels_phys)
                             {
                                 eprintln!("❌ Execution error: {}", e);
                             }
+                            let _ = tx.send(DapEvent::Exited { exit_code: 0 });
                         });
 
-                        // Send initial stopped event after a brief delay
                         thread::sleep(Duration::from_millis(100));
                         self.send_event(
                             "stopped".to_string(),
@@ -164,6 +192,19 @@ impl DapServer {
                                 "allThreadsStopped": true
                             })),
                         );
+
+                        thread::spawn(move || loop {
+                            match rx.recv() {
+                                Ok(DapEvent::Stopped { reason, line }) => {
+                                    eprintln!("📥 Received stopped event: {} at {}", reason, line);
+                                }
+                                Ok(DapEvent::Exited { exit_code }) => {
+                                    eprintln!("📥 Received exit event: {}", exit_code);
+                                    break;
+                                }
+                                Err(_) => break,
+                            }
+                        });
                     }
                     Err(e) => {
                         eprintln!("❌ Failed to start CMD session: {}", e);
@@ -196,13 +237,11 @@ impl DapServer {
         let mut verified_breakpoints = Vec::new();
         let mut logical_lines = Vec::new();
 
-        // Convert physical line numbers to logical line numbers
         if let Some(pre) = &self.preprocessed {
             for bp in breakpoints_array {
                 if let Some(line) = bp.get("line").and_then(|v| v.as_u64()) {
                     let phys_line = (line as usize).saturating_sub(1);
 
-                    // Map physical to logical
                     if phys_line < pre.phys_to_logical.len() {
                         let logical_line = pre.phys_to_logical[phys_line];
                         logical_lines.push(logical_line);
@@ -216,7 +255,6 @@ impl DapServer {
             }
         }
 
-        // Store breakpoints and add them to context
         self.breakpoints
             .insert(source_path.to_string(), logical_lines.clone());
 
@@ -257,6 +295,13 @@ impl DapServer {
     pub fn handle_stack_trace(&mut self, seq: u64, command: String) {
         let mut frames = Vec::new();
 
+        // Get the program path (use stored path or fallback)
+        let program_path = self.program_path.as_deref().unwrap_or("test.bat");
+        let program_name = std::path::Path::new(program_path)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("test.bat");
+
         if let Some(ctx_arc) = &self.context {
             if let Ok(ctx) = ctx_arc.lock() {
                 if let Some(pre) = &self.preprocessed {
@@ -267,8 +312,8 @@ impl DapServer {
                         "line": 1,
                         "column": 1,
                         "source": {
-                            "name": "test.bat",
-                            "path": "test.bat"
+                            "name": program_name,
+                            "path": program_path
                         }
                     }));
 
@@ -283,8 +328,8 @@ impl DapServer {
                                 "line": logical.phys_start + 1,
                                 "column": 1,
                                 "source": {
-                                    "name": "test.bat",
-                                    "path": "test.bat"
+                                    "name": program_name,
+                                    "path": program_path
                                 }
                             }));
                         }
@@ -339,7 +384,6 @@ impl DapServer {
             if let Ok(ctx) = ctx_arc.lock() {
                 match var_ref {
                     1 => {
-                        // Local variables (current frame)
                         let visible = ctx.get_visible_variables();
                         for (key, val) in visible {
                             variables.push(json!({
@@ -350,7 +394,6 @@ impl DapServer {
                         }
                     }
                     2 => {
-                        // Global variables
                         for (key, val) in &ctx.variables {
                             variables.push(json!({
                                 "name": key,
@@ -378,15 +421,22 @@ impl DapServer {
         if let Some(ctx_arc) = &self.context {
             if let Ok(mut ctx) = ctx_arc.lock() {
                 ctx.set_mode(RunMode::Continue);
+                ctx.continue_requested = true;
             }
         }
-        self.send_response(seq, command, true, None);
+        self.send_response(
+            seq,
+            command,
+            true,
+            Some(json!({"allThreadsContinued": true})),
+        );
     }
 
     pub fn handle_next(&mut self, seq: u64, command: String) {
         if let Some(ctx_arc) = &self.context {
             if let Ok(mut ctx) = ctx_arc.lock() {
                 ctx.set_mode(RunMode::StepOver);
+                ctx.continue_requested = true;
             }
         }
         self.send_response(seq, command, true, None);
@@ -396,6 +446,7 @@ impl DapServer {
         if let Some(ctx_arc) = &self.context {
             if let Ok(mut ctx) = ctx_arc.lock() {
                 ctx.set_mode(RunMode::StepInto);
+                ctx.continue_requested = true;
             }
         }
         self.send_response(seq, command, true, None);
@@ -405,6 +456,7 @@ impl DapServer {
         if let Some(ctx_arc) = &self.context {
             if let Ok(mut ctx) = ctx_arc.lock() {
                 ctx.set_mode(RunMode::StepOut);
+                ctx.continue_requested = true;
             }
         }
         self.send_response(seq, command, true, None);

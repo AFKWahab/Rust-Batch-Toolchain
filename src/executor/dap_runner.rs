@@ -1,7 +1,5 @@
 use crate::debugger::{leave_context, DebugContext, Frame, RunMode};
-use crate::parser::{
-    is_comment, normalize_whitespace, split_composite_command, CommandOp, PreprocessResult,
-};
+use crate::parser::{is_comment, normalize_whitespace, PreprocessResult};
 use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Mutex};
@@ -17,15 +15,15 @@ pub fn run_debugger_dap(
     let mut step_depth: Option<usize> = None;
 
     'run: loop {
-        // Get current context state
-        let (mode, call_stack_len) = {
-            let ctx = ctx_arc.lock().unwrap();
-            (ctx.mode(), ctx.call_stack.len())
-        };
-
         // EOF unwinding
         while pc >= pre.logical.len() {
-            let mut ctx = ctx_arc.lock().unwrap();
+            let mut ctx = match ctx_arc.lock() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("❌ Failed to lock context: {}", e);
+                    break 'run;
+                }
+            };
             match leave_context(&mut ctx.call_stack) {
                 Some(next_pc) => pc = next_pc,
                 None => break 'run,
@@ -37,15 +35,28 @@ pub fn run_debugger_dap(
         let line = normalize_whitespace(raw.trim());
         let line_upper = line.to_uppercase();
 
-        // Skip empty / comment / label lines
-        if is_comment(&line) || line.trim().starts_with(':') {
+        // Skip empty / comment / label lines (but NOT @echo off)
+        if line.trim().starts_with(':') {
+            pc += 1;
+            continue;
+        }
+
+        // Skip REM and :: comments
+        if line_upper.starts_with("REM ") || line.trim().starts_with("::") {
             pc += 1;
             continue;
         }
 
         // Check if we should stop at this line
         let should_stop = {
-            let ctx = ctx_arc.lock().unwrap();
+            let ctx = match ctx_arc.lock() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("❌ Failed to lock context: {}", e);
+                    break 'run;
+                }
+            };
+
             match ctx.mode() {
                 RunMode::Continue => ctx.should_stop_at(pc),
                 RunMode::StepInto => true,
@@ -63,40 +74,75 @@ pub fn run_debugger_dap(
         // If we should stop, pause and wait for DAP to tell us to continue
         if should_stop {
             eprintln!(
-                "🛑 DAP: Stopped at line {} (phys {})",
+                "🛑 DAP: Stopped at line {} (phys {}): {}",
                 pc,
-                ll.phys_start + 1
+                ll.phys_start + 1,
+                raw
             );
 
-            // Wait for the mode to change (DAP client sends continue/step commands)
-            loop {
-                std::thread::sleep(Duration::from_millis(100));
-                let ctx = ctx_arc.lock().unwrap();
+            // Reset the continue flag
+            {
+                let mut ctx = match ctx_arc.lock() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("❌ Failed to lock context: {}", e);
+                        break 'run;
+                    }
+                };
+                ctx.continue_requested = false;
+            }
 
-                match ctx.mode() {
-                    RunMode::Continue => {
-                        step_depth = None;
-                        break;
+            // Wait for continue_requested to be set to true
+            let mut wait_count = 0;
+            loop {
+                std::thread::sleep(Duration::from_millis(50));
+                wait_count += 1;
+
+                // Timeout after 5 minutes (6000 * 50ms)
+                if wait_count > 6000 {
+                    eprintln!("⚠️ Timeout waiting for step command");
+                    break 'run;
+                }
+
+                let ctx = match ctx_arc.lock() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("❌ Failed to lock context during wait: {}", e);
+                        break 'run;
                     }
-                    RunMode::StepOver => {
-                        step_depth = Some(ctx.call_stack.len());
-                        break;
+                };
+
+                if ctx.continue_requested {
+                    eprintln!("✓ Continue requested, mode: {:?}", ctx.mode());
+                    // Update step_depth based on mode
+                    match ctx.mode() {
+                        RunMode::Continue => {
+                            step_depth = None;
+                        }
+                        RunMode::StepOver => {
+                            step_depth = Some(ctx.call_stack.len());
+                        }
+                        RunMode::StepInto => {
+                            step_depth = None;
+                        }
+                        RunMode::StepOut => {
+                            step_depth = None;
+                        }
                     }
-                    RunMode::StepInto => {
-                        step_depth = None;
-                        break;
-                    }
-                    RunMode::StepOut => {
-                        step_depth = None;
-                        break;
-                    }
+                    break;
                 }
             }
         }
 
         // Execute the line (same logic as interactive mode)
         {
-            let mut ctx = ctx_arc.lock().unwrap();
+            let mut ctx = match ctx_arc.lock() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("❌ Failed to lock context for execution: {}", e);
+                    break 'run;
+                }
+            };
 
             // Handle SETLOCAL
             if line_upper.starts_with("SETLOCAL") {
@@ -183,12 +229,21 @@ pub fn run_debugger_dap(
             }
 
             // Execute normal command
+            eprintln!("▶️ Executing: {}", line);
             ctx.track_set_command(&line);
-            let (out, code) = ctx.run_command(&line)?;
-            if !out.trim().is_empty() {
-                print!("{}", out);
+
+            match ctx.run_command(&line) {
+                Ok((out, code)) => {
+                    if !out.trim().is_empty() {
+                        print!("{}", out);
+                    }
+                    ctx.last_exit_code = code;
+                }
+                Err(e) => {
+                    eprintln!("❌ Command execution error: {}", e);
+                    break 'run;
+                }
             }
-            ctx.last_exit_code = code;
         }
 
         pc += 1;

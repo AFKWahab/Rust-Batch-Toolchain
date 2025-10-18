@@ -10,12 +10,13 @@ call :greet "Alice" 25
 call :greet "Bob" 30
 echo Back in main after subroutines
 
-REM ===== Goto example with delayed expansion =====
+REM ===== Loop example with GOTO =====
+REM NOTE: Due to block execution limitations, use conditional GOTO carefully
 set COUNTER=0
-
 :loop_start
 set /a COUNTER+=1
 echo Loop iteration !COUNTER!
+REM Use single-line for simple conditions (will work in continue mode)
 if !COUNTER! LSS 3 goto :loop_start
 
 REM ===== Nested calls (call stack test) =====

@@ -13,6 +13,7 @@ pub struct DebugContext {
     breakpoints: Breakpoints,
     mode: RunMode,
     step_out_target_depth: usize,
+    pub continue_requested: bool, // ADDED
 }
 
 impl DebugContext {
@@ -25,6 +26,7 @@ impl DebugContext {
             breakpoints: Breakpoints::new(),
             mode: RunMode::Continue,
             step_out_target_depth: 0,
+            continue_requested: false, // ADDED
         }
     }
 
@@ -128,8 +130,6 @@ impl DebugContext {
         eprintln!();
     }
 
-    // Replace the track_set_command method in debugger/context.rs
-
     /// Track SET commands - stores in appropriate scope
     pub fn track_set_command(&mut self, line: &str) {
         let l = line.trim_start();
@@ -141,8 +141,6 @@ impl DebugContext {
 
         // Handle /A (arithmetic) - we can't track these accurately without executing
         if rest.to_uppercase().starts_with("/A") {
-            // Skip arithmetic operations like SET /A COUNTER+=1
-            // We would need to execute the math to know the value
             return;
         }
 
