@@ -85,6 +85,10 @@ pub fn run_dap_mode() -> io::Result<()> {
                     "stepOut" => {
                         server.handle_step_out(msg.seq, command);
                     }
+                    "pause" => {
+                        eprintln!("Handling pause");
+                        server.handle_pause(msg.seq, command);
+                    }
                     "disconnect" => {
                         server.send_response(msg.seq, command, true, None);
                         break;

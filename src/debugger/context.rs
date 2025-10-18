@@ -6,14 +6,14 @@ use std::io;
 
 pub struct DebugContext {
     session: CmdSession,
-    /// Global variables (when not in a SETLOCAL scope)
     pub variables: HashMap<String, String>,
     pub call_stack: Vec<Frame>,
     pub last_exit_code: i32,
     breakpoints: Breakpoints,
     mode: RunMode,
     step_out_target_depth: usize,
-    pub continue_requested: bool, // ADDED
+    pub continue_requested: bool,
+    pub current_line: Option<usize>,
 }
 
 impl DebugContext {
@@ -26,7 +26,8 @@ impl DebugContext {
             breakpoints: Breakpoints::new(),
             mode: RunMode::Continue,
             step_out_target_depth: 0,
-            continue_requested: false, // ADDED
+            continue_requested: false,
+            current_line: None,
         }
     }
 

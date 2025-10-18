@@ -1,26 +1,55 @@
 use crate::debugger::{leave_context, DebugContext, Frame, RunMode};
 use crate::parser::{is_comment, normalize_whitespace, PreprocessResult};
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, Write};
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// DAP-specific executor that sends stopped events instead of interactive prompts
+/// DAP-specific executor that sends stopped events via channel instead of interactive prompts
 pub fn run_debugger_dap(
     ctx_arc: Arc<Mutex<DebugContext>>,
     pre: &PreprocessResult,
     labels_phys: &HashMap<String, usize>,
+    event_tx: Sender<(String, usize)>,
 ) -> io::Result<()> {
+    // Create log file for this thread
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("C:\\temp\\batch-debugger-vscode.log")
+        .ok();
+
+    if let Some(ref mut f) = log {
+        writeln!(f, "run_debugger_dap: ENTRY").ok();
+        writeln!(f, "  Logical lines: {}", pre.logical.len()).ok();
+        f.flush().ok();
+    }
+
     let mut pc: usize = 0;
     let mut step_depth: Option<usize> = None;
 
     'run: loop {
+        if let Some(ref mut f) = log {
+            writeln!(f, "Main loop: pc={}", pc).ok();
+            f.flush().ok();
+        }
+
         // EOF unwinding
         while pc >= pre.logical.len() {
+            if let Some(ref mut f) = log {
+                writeln!(f, "EOF reached, unwinding").ok();
+                f.flush().ok();
+            }
+
             let mut ctx = match ctx_arc.lock() {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("❌ Failed to lock context: {}", e);
+                    if let Some(ref mut f) = log {
+                        writeln!(f, "❌ Failed to lock context: {}", e).ok();
+                        f.flush().ok();
+                    }
                     break 'run;
                 }
             };
@@ -35,29 +64,51 @@ pub fn run_debugger_dap(
         let line = normalize_whitespace(raw.trim());
         let line_upper = line.to_uppercase();
 
-        // Skip empty / comment / label lines (but NOT @echo off)
+        if let Some(ref mut f) = log {
+            writeln!(f, "Processing line {}: '{}'", pc, raw).ok();
+            f.flush().ok();
+        }
+
+        // Skip label lines
         if line.trim().starts_with(':') {
+            if let Some(ref mut f) = log {
+                writeln!(f, "  Skipping label line").ok();
+                f.flush().ok();
+            }
             pc += 1;
             continue;
         }
 
         // Skip REM and :: comments
         if line_upper.starts_with("REM ") || line.trim().starts_with("::") {
+            if let Some(ref mut f) = log {
+                writeln!(f, "  Skipping comment line").ok();
+                f.flush().ok();
+            }
             pc += 1;
             continue;
         }
 
         // Check if we should stop at this line
         let should_stop = {
+            if let Some(ref mut f) = log {
+                writeln!(f, "  Checking if should stop...").ok();
+                f.flush().ok();
+            }
+
             let ctx = match ctx_arc.lock() {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("❌ Failed to lock context: {}", e);
+                    if let Some(ref mut f) = log {
+                        writeln!(f, "❌ Failed to lock context: {}", e).ok();
+                        f.flush().ok();
+                    }
                     break 'run;
                 }
             };
 
-            match ctx.mode() {
+            let stop = match ctx.mode() {
                 RunMode::Continue => ctx.should_stop_at(pc),
                 RunMode::StepInto => true,
                 RunMode::StepOver => {
@@ -68,7 +119,14 @@ pub fn run_debugger_dap(
                     }
                 }
                 RunMode::StepOut => ctx.should_stop_at(pc),
+            };
+
+            if let Some(ref mut f) = log {
+                writeln!(f, "  Should stop: {}, mode: {:?}", stop, ctx.mode()).ok();
+                f.flush().ok();
             }
+
+            stop
         };
 
         // If we should stop, pause and wait for DAP to tell us to continue
@@ -80,27 +138,103 @@ pub fn run_debugger_dap(
                 raw
             );
 
-            // Reset the continue flag
-            {
-                let mut ctx = match ctx_arc.lock() {
+            if let Some(ref mut f) = log {
+                writeln!(
+                    f,
+                    "🛑 STOPPED at line {} (phys {}): {}",
+                    pc,
+                    ll.phys_start + 1,
+                    raw
+                )
+                .ok();
+                f.flush().ok();
+            }
+
+            // Determine the stop reason
+            let stop_reason = {
+                let ctx = match ctx_arc.lock() {
                     Ok(c) => c,
                     Err(e) => {
                         eprintln!("❌ Failed to lock context: {}", e);
                         break 'run;
                     }
                 };
+
+                match ctx.mode() {
+                    RunMode::Continue => "breakpoint",
+                    RunMode::StepInto | RunMode::StepOver | RunMode::StepOut => "step",
+                }
+            };
+
+            // Send stopped event through channel
+            if let Err(e) = event_tx.send((stop_reason.to_string(), pc)) {
+                eprintln!("❌ Failed to send stopped event: {}", e);
+                if let Some(ref mut f) = log {
+                    writeln!(f, "❌ Failed to send stopped event: {}", e).ok();
+                    f.flush().ok();
+                }
+                break 'run;
+            }
+
+            eprintln!("📤 Sent stopped event: {}", stop_reason);
+            if let Some(ref mut f) = log {
+                writeln!(f, "📤 Sent stopped event: {}", stop_reason).ok();
+                f.flush().ok();
+            }
+
+            // Reset the continue flag and set current line
+            {
+                let mut ctx = match ctx_arc.lock() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        eprintln!("❌ Failed to lock context: {}", e);
+                        if let Some(ref mut f) = log {
+                            writeln!(f, "❌ Failed to lock context: {}", e).ok();
+                            f.flush().ok();
+                        }
+                        break 'run;
+                    }
+                };
                 ctx.continue_requested = false;
+                ctx.current_line = Some(pc);
+
+                if let Some(ref mut f) = log {
+                    writeln!(
+                        f,
+                        "  Reset continue_requested to false, set current_line to {}",
+                        pc
+                    )
+                    .ok();
+                    f.flush().ok();
+                }
             }
 
             // Wait for continue_requested to be set to true
             let mut wait_count = 0;
+            if let Some(ref mut f) = log {
+                writeln!(f, "  Entering wait loop...").ok();
+                f.flush().ok();
+            }
+
             loop {
                 std::thread::sleep(Duration::from_millis(50));
                 wait_count += 1;
 
-                // Timeout after 5 minutes (6000 * 50ms)
+                if wait_count % 20 == 0 {
+                    // Log every second
+                    if let Some(ref mut f) = log {
+                        writeln!(f, "  Still waiting... ({} iterations)", wait_count).ok();
+                        f.flush().ok();
+                    }
+                }
+
+                // Timeout after 5 minutes
                 if wait_count > 6000 {
                     eprintln!("⚠️ Timeout waiting for step command");
+                    if let Some(ref mut f) = log {
+                        writeln!(f, "⚠️ Timeout waiting for step command").ok();
+                        f.flush().ok();
+                    }
                     break 'run;
                 }
 
@@ -108,12 +242,21 @@ pub fn run_debugger_dap(
                     Ok(c) => c,
                     Err(e) => {
                         eprintln!("❌ Failed to lock context during wait: {}", e);
+                        if let Some(ref mut f) = log {
+                            writeln!(f, "❌ Failed to lock context during wait: {}", e).ok();
+                            f.flush().ok();
+                        }
                         break 'run;
                     }
                 };
 
                 if ctx.continue_requested {
                     eprintln!("✓ Continue requested, mode: {:?}", ctx.mode());
+                    if let Some(ref mut f) = log {
+                        writeln!(f, "✓ Continue requested, mode: {:?}", ctx.mode()).ok();
+                        f.flush().ok();
+                    }
+
                     // Update step_depth based on mode
                     match ctx.mode() {
                         RunMode::Continue => {
@@ -132,14 +275,28 @@ pub fn run_debugger_dap(
                     break;
                 }
             }
+
+            if let Some(ref mut f) = log {
+                writeln!(f, "  Exited wait loop, continuing execution").ok();
+                f.flush().ok();
+            }
         }
 
-        // Execute the line (same logic as interactive mode)
+        // Execute the line
         {
+            if let Some(ref mut f) = log {
+                writeln!(f, "  Executing line: '{}'", line).ok();
+                f.flush().ok();
+            }
+
             let mut ctx = match ctx_arc.lock() {
                 Ok(c) => c,
                 Err(e) => {
                     eprintln!("❌ Failed to lock context for execution: {}", e);
+                    if let Some(ref mut f) = log {
+                        writeln!(f, "❌ Failed to lock context for execution: {}", e).ok();
+                        f.flush().ok();
+                    }
                     break 'run;
                 }
             };
@@ -232,8 +389,18 @@ pub fn run_debugger_dap(
             eprintln!("▶️ Executing: {}", line);
             ctx.track_set_command(&line);
 
+            if let Some(ref mut f) = log {
+                writeln!(f, "  About to run_command: '{}'", line).ok();
+                f.flush().ok();
+            }
+
             match ctx.run_command(&line) {
                 Ok((out, code)) => {
+                    if let Some(ref mut f) = log {
+                        writeln!(f, "  Command executed, exit code: {}", code).ok();
+                        f.flush().ok();
+                    }
+
                     if !out.trim().is_empty() {
                         print!("{}", out);
                     }
@@ -241,6 +408,10 @@ pub fn run_debugger_dap(
                 }
                 Err(e) => {
                     eprintln!("❌ Command execution error: {}", e);
+                    if let Some(ref mut f) = log {
+                        writeln!(f, "❌ Command execution error: {}", e).ok();
+                        f.flush().ok();
+                    }
                     break 'run;
                 }
             }
@@ -250,5 +421,14 @@ pub fn run_debugger_dap(
     }
 
     eprintln!("✅ DAP: Script execution completed");
+    if let Some(ref mut f) = log {
+        writeln!(f, "✅ DAP: Script execution completed").ok();
+        f.flush().ok();
+    }
+
+    // Send a final "terminated" event through the channel
+    // This will help VS Code know the script has finished
+    let _ = event_tx.send(("terminated".to_string(), 0));
+
     Ok(())
 }
