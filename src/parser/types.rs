@@ -17,7 +17,7 @@ pub struct LogicalLine {
 }
 
 /// Output of preprocessing: logical lines + mapping back to physical indices.
-#[derive(Debug)]
+#[derive(Debug, Clone)] // <-- ADD Clone here
 pub struct PreprocessResult {
     pub logical: Vec<LogicalLine>,
     pub phys_to_logical: Vec<usize>,

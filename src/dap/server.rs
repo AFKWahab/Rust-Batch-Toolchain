@@ -1,11 +1,13 @@
 use super::protocol::{DapMessage, DapMessageContent};
 use crate::debugger::{CmdSession, DebugContext, RunMode};
+use crate::executor; // <-- ADD this import
 use crate::parser::{self, PreprocessResult};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{self, BufRead, Read, Write};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration; // <-- ADD this import
 
 pub struct DapServer {
     seq: u64,
@@ -117,7 +119,6 @@ impl DapServer {
     }
 
     pub fn handle_launch(&mut self, seq: u64, command: String, args: Option<Value>) {
-        // Extract the batch file path from launch arguments
         let program = args
             .as_ref()
             .and_then(|v| v.get("program"))
@@ -126,25 +127,35 @@ impl DapServer {
 
         eprintln!("🚀 Launching batch file: {}", program);
 
-        // Read and preprocess the batch file
         match std::fs::read_to_string(program) {
             Ok(contents) => {
                 let physical_lines: Vec<&str> = contents.lines().collect();
                 let pre = parser::preprocess_lines(&physical_lines);
                 let labels_phys = parser::build_label_map(&physical_lines);
 
-                // Initialize the debug context
                 match CmdSession::start() {
                     Ok(session) => {
                         let mut ctx = DebugContext::new(session);
-                        ctx.set_mode(RunMode::StepInto); // Start paused
+                        ctx.set_mode(RunMode::Continue); // Start in continue mode
 
-                        self.context = Some(Arc::new(Mutex::new(ctx)));
-                        self.preprocessed = Some(pre);
-                        self.labels = Some(labels_phys);
+                        let ctx_arc = Arc::new(Mutex::new(ctx));
+                        self.context = Some(ctx_arc.clone());
+                        self.preprocessed = Some(pre.clone());
+                        self.labels = Some(labels_phys.clone());
 
                         self.send_response(seq, command, true, None);
                         self.send_event("initialized".to_string(), None);
+
+                        // IMPORTANT: Spawn execution thread
+                        thread::spawn(move || {
+                            if let Err(e) = executor::run_debugger_dap(ctx_arc, &pre, &labels_phys)
+                            {
+                                eprintln!("❌ Execution error: {}", e);
+                            }
+                        });
+
+                        // Send initial stopped event after a brief delay
+                        thread::sleep(Duration::from_millis(100));
                         self.send_event(
                             "stopped".to_string(),
                             Some(json!({

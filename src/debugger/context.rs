@@ -128,6 +128,8 @@ impl DebugContext {
         eprintln!();
     }
 
+    // Replace the track_set_command method in debugger/context.rs
+
     /// Track SET commands - stores in appropriate scope
     pub fn track_set_command(&mut self, line: &str) {
         let l = line.trim_start();
@@ -137,15 +139,16 @@ impl DebugContext {
 
         let mut rest = l[3..].trim_start();
 
-        // Optional switches: /A (arithmetic) or /P (prompt)
-        if let Some(r) = rest.strip_prefix("/A") {
-            rest = r.trim_start();
-        } else if let Some(r) = rest.strip_prefix("/a") {
-            rest = r.trim_start();
-        } else if let Some(r) = rest.strip_prefix("/P") {
-            rest = r.trim_start();
-        } else if let Some(r) = rest.strip_prefix("/p") {
-            rest = r.trim_start();
+        // Handle /A (arithmetic) - we can't track these accurately without executing
+        if rest.to_uppercase().starts_with("/A") {
+            // Skip arithmetic operations like SET /A COUNTER+=1
+            // We would need to execute the math to know the value
+            return;
+        }
+
+        // Handle /P (prompt) - skip these as they require user input
+        if rest.to_uppercase().starts_with("/P") {
+            return;
         }
 
         // Handle quoted SET "VAR=VAL"
@@ -160,7 +163,13 @@ impl DebugContext {
             let key = rest[..eq_pos].trim().to_string();
             let val = rest[eq_pos + 1..].trim().to_string();
 
-            if !key.is_empty() {
+            // Only track simple assignments (no operators in the key)
+            if !key.is_empty()
+                && !key.contains('+')
+                && !key.contains('-')
+                && !key.contains('*')
+                && !key.contains('/')
+            {
                 // Store in local scope if SETLOCAL is active, otherwise global
                 if let Some(frame) = self.call_stack.last_mut() {
                     if frame.has_setlocal {
