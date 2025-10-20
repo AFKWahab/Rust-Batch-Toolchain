@@ -1,5 +1,5 @@
 use crate::debugger::{leave_context, DebugContext, Frame, RunMode};
-use crate::parser::{is_comment, normalize_whitespace, PreprocessResult};
+use crate::parser::{normalize_whitespace, PreprocessResult};
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::sync::mpsc::Sender;
@@ -12,6 +12,7 @@ pub fn run_debugger_dap(
     pre: &PreprocessResult,
     labels_phys: &HashMap<String, usize>,
     event_tx: Sender<(String, usize)>,
+    output_tx: Sender<String>,
 ) -> io::Result<()> {
     // Create log file for this thread
     let mut log = std::fs::OpenOptions::new()
@@ -306,7 +307,9 @@ pub fn run_debugger_dap(
                 ctx.handle_setlocal();
                 let (out, code) = ctx.run_command(&line)?;
                 if !out.trim().is_empty() {
-                    print!("{}", out);
+                    if let Err(e) = output_tx.send(out.clone()) {
+                        eprintln!("❌ Failed to send output: {}", e);
+                    }
                 }
                 ctx.last_exit_code = code;
                 pc += 1;
@@ -318,7 +321,9 @@ pub fn run_debugger_dap(
                 ctx.handle_endlocal();
                 let (out, code) = ctx.run_command(&line)?;
                 if !out.trim().is_empty() {
-                    print!("{}", out);
+                    if let Err(e) = output_tx.send(out.clone()) {
+                        eprintln!("❌ Failed to send output: {}", e);
+                    }
                 }
                 ctx.last_exit_code = code;
                 pc += 1;
@@ -402,7 +407,13 @@ pub fn run_debugger_dap(
                     }
 
                     if !out.trim().is_empty() {
-                        print!("{}", out);
+                        if let Err(e) = output_tx.send(out.clone()) {
+                            eprintln!("❌ Failed to send output: {}", e);
+                            if let Some(ref mut f) = log {
+                                writeln!(f, "❌ Failed to send output: {}", e).ok();
+                                f.flush().ok();
+                            }
+                        }
                     }
                     ctx.last_exit_code = code;
                 }

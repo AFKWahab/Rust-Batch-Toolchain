@@ -4,8 +4,8 @@ use crate::executor;
 use crate::parser::{self, PreprocessResult};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::io::{self, BufRead, Read, Write};
-use std::sync::mpsc::{channel, Receiver, Sender}; // ← Updated this line
+use std::io::{self, BufRead, Read};
+use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -17,7 +17,8 @@ pub struct DapServer {
     labels: Option<HashMap<String, usize>>,
     breakpoints: HashMap<String, Vec<usize>>,
     program_path: Option<String>,
-    event_receiver: Option<Receiver<(String, usize)>>, // Add this back!
+    pub event_receiver: Option<Receiver<(String, usize)>>,
+    pub output_receiver: Option<Receiver<String>>,
 }
 
 impl DapServer {
@@ -29,7 +30,8 @@ impl DapServer {
             labels: None,
             breakpoints: HashMap::new(),
             program_path: None,
-            event_receiver: None, // Add this back!
+            event_receiver: None,
+            output_receiver: None,
         }
     }
     fn next_seq(&mut self) -> u64 {
@@ -65,6 +67,19 @@ impl DapServer {
             content: DapMessageContent::Event { event, body },
         };
         self.send_message(&msg);
+    }
+
+    pub fn send_output(&mut self, output: &str, category: &str) {
+        if output.is_empty() {
+            return;
+        }
+        self.send_event(
+            "output".to_string(),
+            Some(json!({
+                "category": category,
+                "output": output
+            })),
+        );
     }
 
     fn send_message(&self, msg: &DapMessage) {
@@ -219,9 +234,11 @@ impl DapServer {
                         }
 
                         let (tx, rx) = channel::<(String, usize)>();
+                        let (output_tx, output_rx) = channel::<String>();
 
-                        // Store the receiver so we can use it later
+                        // Store the receivers so we can use them later
                         self.event_receiver = Some(rx);
+                        self.output_receiver = Some(output_rx);
 
                         let exec_ctx = ctx_arc.clone();
                         let exec_pre = pre.clone();
@@ -242,8 +259,13 @@ impl DapServer {
 
                             eprintln!("🧵 Execution thread started");
 
-                            match executor::run_debugger_dap(exec_ctx, &exec_pre, &exec_labels, tx)
-                            {
+                            match executor::run_debugger_dap(
+                                exec_ctx,
+                                &exec_pre,
+                                &exec_labels,
+                                tx,
+                                output_tx,
+                            ) {
                                 Ok(_) => {
                                     eprintln!("✅ Execution completed successfully");
                                     if let Some(ref mut f) = tlog {
@@ -274,6 +296,17 @@ impl DapServer {
                             use std::io::Write;
                             writeln!(f, "Execution thread spawned, waiting for first stop").ok();
                             f.flush().ok();
+                        }
+
+                        // Process any output that came through before the first stop
+                        if let Some(ref output_rx) = self.output_receiver {
+                            let mut outputs = Vec::new();
+                            while let Ok(output) = output_rx.try_recv() {
+                                outputs.push(output);
+                            }
+                            for output in outputs {
+                                self.send_output(&output, "stdout");
+                            }
                         }
 
                         // Wait for the first stopped event and send it
@@ -574,6 +607,17 @@ impl DapServer {
             Some(json!({"allThreadsContinued": true})),
         );
 
+        // Process any pending output
+        let mut outputs = Vec::new();
+        if let Some(ref output_rx) = self.output_receiver {
+            while let Ok(output) = output_rx.try_recv() {
+                outputs.push(output);
+            }
+        }
+        for output in outputs {
+            self.send_output(&output, "stdout");
+        }
+
         // Check for stopped event from execution thread
         if let Some(ref rx) = self.event_receiver {
             if let Ok((reason, _line)) = rx.recv_timeout(Duration::from_millis(500)) {
@@ -601,6 +645,17 @@ impl DapServer {
             }
         }
         self.send_response(seq, command, true, None);
+
+        // Process any pending output
+        let mut outputs = Vec::new();
+        if let Some(ref output_rx) = self.output_receiver {
+            while let Ok(output) = output_rx.try_recv() {
+                outputs.push(output);
+            }
+        }
+        for output in outputs {
+            self.send_output(&output, "stdout");
+        }
 
         // Check for stopped event from execution thread
         if let Some(ref rx) = self.event_receiver {
@@ -630,6 +685,17 @@ impl DapServer {
         }
         self.send_response(seq, command, true, None);
 
+        // Process any pending output
+        let mut outputs = Vec::new();
+        if let Some(ref output_rx) = self.output_receiver {
+            while let Ok(output) = output_rx.try_recv() {
+                outputs.push(output);
+            }
+        }
+        for output in outputs {
+            self.send_output(&output, "stdout");
+        }
+
         // Check for stopped event from execution thread
         if let Some(ref rx) = self.event_receiver {
             if let Ok((reason, _line)) = rx.recv_timeout(Duration::from_millis(500)) {
@@ -657,6 +723,17 @@ impl DapServer {
             }
         }
         self.send_response(seq, command, true, None);
+
+        // Process any pending output
+        let mut outputs = Vec::new();
+        if let Some(ref output_rx) = self.output_receiver {
+            while let Ok(output) = output_rx.try_recv() {
+                outputs.push(output);
+            }
+        }
+        for output in outputs {
+            self.send_output(&output, "stdout");
+        }
 
         // Check for stopped event from execution thread
         if let Some(ref rx) = self.event_receiver {
@@ -698,5 +775,17 @@ impl DapServer {
                 "allThreadsStopped": true
             })),
         );
+    }
+
+    pub fn check_and_send_output(&mut self) {
+        let mut outputs = Vec::new();
+        if let Some(ref output_rx) = self.output_receiver {
+            while let Ok(output) = output_rx.try_recv() {
+                outputs.push(output);
+            }
+        }
+        for output in outputs {
+            self.send_output(&output, "stdout");
+        }
     }
 }
