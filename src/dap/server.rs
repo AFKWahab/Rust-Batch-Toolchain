@@ -5,10 +5,82 @@ use crate::parser::{self, PreprocessResult};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{self, BufRead, Read};
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+
+// Helper struct for non-blocking message reading
+struct MessageReader {
+    receiver: Option<Receiver<Option<DapMessage>>>,
+}
+
+impl MessageReader {
+    fn new() -> Self {
+        Self { receiver: None }
+    }
+
+    fn start_read(&mut self) {
+        let (tx, rx) = channel();
+        self.receiver = Some(rx);
+
+        thread::spawn(move || {
+            let stdin = io::stdin();
+            let mut handle = stdin.lock();
+
+            let mut content_length = 0;
+            let mut lines = handle.by_ref().lines();
+
+            loop {
+                match lines.next() {
+                    Some(Ok(line)) => {
+                        if line.is_empty() || line == "\r" {
+                            break;
+                        }
+                        if line.starts_with("Content-Length:") {
+                            content_length = line[15..].trim().parse().unwrap_or(0);
+                        }
+                    }
+                    _ => {
+                        let _ = tx.send(None);
+                        return;
+                    }
+                }
+            }
+
+            if content_length > 0 {
+                let mut buffer = vec![0u8; content_length];
+                drop(lines);
+                if handle.read_exact(&mut buffer).is_ok() {
+                    if let Ok(msg) = serde_json::from_slice(&buffer) {
+                        let _ = tx.send(Some(msg));
+                        return;
+                    }
+                }
+            }
+
+            let _ = tx.send(None);
+        });
+    }
+
+    fn try_receive(&mut self) -> Option<Option<DapMessage>> {
+        if let Some(ref rx) = self.receiver {
+            match rx.try_recv() {
+                Ok(msg) => {
+                    self.receiver = None; // Clear for next read
+                    Some(msg)
+                }
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => {
+                    self.receiver = None;
+                    Some(None)
+                }
+            }
+        } else {
+            None
+        }
+    }
+}
 
 pub struct DapServer {
     seq: u64,
@@ -19,6 +91,7 @@ pub struct DapServer {
     program_path: Option<String>,
     pub event_receiver: Option<Receiver<(String, usize)>>,
     pub output_receiver: Option<Receiver<String>>,
+    message_reader: MessageReader,
 }
 
 impl DapServer {
@@ -32,8 +105,10 @@ impl DapServer {
             program_path: None,
             event_receiver: None,
             output_receiver: None,
+            message_reader: MessageReader::new(),
         }
     }
+
     fn next_seq(&mut self) -> u64 {
         self.seq += 1;
         self.seq
@@ -86,17 +161,12 @@ impl DapServer {
         let json = serde_json::to_string(msg).unwrap();
         let content_length = json.len();
 
-        // Write to stdout with proper protocol format
-        // CRITICAL: Must be exactly "Content-Length: {len}\r\n\r\n{json}"
         let output = format!("Content-Length: {}\r\n\r\n{}", content_length, json);
-
         print!("{}", output);
 
-        // MUST flush immediately
         use std::io::Write;
         let _ = std::io::stdout().flush();
 
-        // Debug log to stderr (won't interfere with DAP protocol)
         eprintln!("📤 Sent {} bytes", content_length);
     }
 
@@ -133,6 +203,20 @@ impl DapServer {
         None
     }
 
+    pub fn try_read_message(&mut self) -> Option<DapMessage> {
+        // Check if we have a pending read
+        if let Some(result) = self.message_reader.try_receive() {
+            return result;
+        }
+
+        // Start a new read if we don't have one pending
+        if self.message_reader.receiver.is_none() {
+            self.message_reader.start_read();
+        }
+
+        None
+    }
+
     pub fn handle_initialize(&mut self, seq: u64, command: String) {
         let body = json!({
             "supportsConfigurationDoneRequest": true,
@@ -144,7 +228,6 @@ impl DapServer {
         });
         self.send_response(seq, command, true, Some(body));
 
-        // CRITICAL: Send initialized event after response
         eprintln!("📋 Sending initialized event");
         self.send_event("initialized".to_string(), None);
     }
@@ -236,7 +319,6 @@ impl DapServer {
                         let (tx, rx) = channel::<(String, usize)>();
                         let (output_tx, output_rx) = channel::<String>();
 
-                        // Store the receivers so we can use them later
                         self.event_receiver = Some(rx);
                         self.output_receiver = Some(output_rx);
 
@@ -389,7 +471,6 @@ impl DapServer {
         if let Some(pre) = &self.preprocessed {
             for bp in breakpoints_array {
                 if let Some(line) = bp.get("line").and_then(|v| v.as_u64()) {
-                    // VS Code sends 1-based line numbers
                     let phys_line = (line as usize).saturating_sub(1);
 
                     eprintln!(
@@ -466,12 +547,10 @@ impl DapServer {
         if let Some(ctx_arc) = &self.context {
             if let Ok(ctx) = ctx_arc.lock() {
                 if let Some(pre) = &self.preprocessed {
-                    // Get the current PC (program counter) from the context
                     let current_pc = ctx.current_line.unwrap_or(0);
 
-                    // Get the physical line number for the current logical line
                     let physical_line = if current_pc < pre.logical.len() {
-                        pre.logical[current_pc].phys_start + 1 // +1 because VS Code uses 1-based lines
+                        pre.logical[current_pc].phys_start + 1
                     } else {
                         1
                     };
@@ -481,7 +560,6 @@ impl DapServer {
                         current_pc, physical_line
                     );
 
-                    // Add current frame with the ACTUAL current line
                     frames.push(json!({
                         "id": 0,
                         "name": "main",
@@ -493,7 +571,6 @@ impl DapServer {
                         }
                     }));
 
-                    // Add call stack frames
                     for (i, frame) in ctx.call_stack.iter().enumerate() {
                         let return_line = frame.return_pc.saturating_sub(1);
                         if return_line < pre.logical.len() {
@@ -606,35 +683,7 @@ impl DapServer {
             true,
             Some(json!({"allThreadsContinued": true})),
         );
-
-        // Process any pending output
-        let mut outputs = Vec::new();
-        if let Some(ref output_rx) = self.output_receiver {
-            while let Ok(output) = output_rx.try_recv() {
-                outputs.push(output);
-            }
-        }
-        for output in outputs {
-            self.send_output(&output, "stdout");
-        }
-
-        // Check for stopped event from execution thread
-        if let Some(ref rx) = self.event_receiver {
-            if let Ok((reason, _line)) = rx.recv_timeout(Duration::from_millis(500)) {
-                if reason != "terminated" {
-                    self.send_event(
-                        "stopped".to_string(),
-                        Some(json!({
-                            "reason": reason,
-                            "threadId": 1,
-                            "allThreadsStopped": true
-                        })),
-                    );
-                } else {
-                    self.send_event("terminated".to_string(), None);
-                }
-            }
-        }
+        // Event polling now happens in main loop
     }
 
     pub fn handle_next(&mut self, seq: u64, command: String) {
@@ -645,35 +694,7 @@ impl DapServer {
             }
         }
         self.send_response(seq, command, true, None);
-
-        // Process any pending output
-        let mut outputs = Vec::new();
-        if let Some(ref output_rx) = self.output_receiver {
-            while let Ok(output) = output_rx.try_recv() {
-                outputs.push(output);
-            }
-        }
-        for output in outputs {
-            self.send_output(&output, "stdout");
-        }
-
-        // Check for stopped event from execution thread
-        if let Some(ref rx) = self.event_receiver {
-            if let Ok((reason, _line)) = rx.recv_timeout(Duration::from_millis(500)) {
-                if reason != "terminated" {
-                    self.send_event(
-                        "stopped".to_string(),
-                        Some(json!({
-                            "reason": reason,
-                            "threadId": 1,
-                            "allThreadsStopped": true
-                        })),
-                    );
-                } else {
-                    self.send_event("terminated".to_string(), None);
-                }
-            }
-        }
+        // Event polling now happens in main loop
     }
 
     pub fn handle_step_in(&mut self, seq: u64, command: String) {
@@ -684,35 +705,7 @@ impl DapServer {
             }
         }
         self.send_response(seq, command, true, None);
-
-        // Process any pending output
-        let mut outputs = Vec::new();
-        if let Some(ref output_rx) = self.output_receiver {
-            while let Ok(output) = output_rx.try_recv() {
-                outputs.push(output);
-            }
-        }
-        for output in outputs {
-            self.send_output(&output, "stdout");
-        }
-
-        // Check for stopped event from execution thread
-        if let Some(ref rx) = self.event_receiver {
-            if let Ok((reason, _line)) = rx.recv_timeout(Duration::from_millis(500)) {
-                if reason != "terminated" {
-                    self.send_event(
-                        "stopped".to_string(),
-                        Some(json!({
-                            "reason": reason,
-                            "threadId": 1,
-                            "allThreadsStopped": true
-                        })),
-                    );
-                } else {
-                    self.send_event("terminated".to_string(), None);
-                }
-            }
-        }
+        // Event polling now happens in main loop
     }
 
     pub fn handle_step_out(&mut self, seq: u64, command: String) {
@@ -723,50 +716,18 @@ impl DapServer {
             }
         }
         self.send_response(seq, command, true, None);
-
-        // Process any pending output
-        let mut outputs = Vec::new();
-        if let Some(ref output_rx) = self.output_receiver {
-            while let Ok(output) = output_rx.try_recv() {
-                outputs.push(output);
-            }
-        }
-        for output in outputs {
-            self.send_output(&output, "stdout");
-        }
-
-        // Check for stopped event from execution thread
-        if let Some(ref rx) = self.event_receiver {
-            if let Ok((reason, _line)) = rx.recv_timeout(Duration::from_millis(500)) {
-                if reason != "terminated" {
-                    self.send_event(
-                        "stopped".to_string(),
-                        Some(json!({
-                            "reason": reason,
-                            "threadId": 1,
-                            "allThreadsStopped": true
-                        })),
-                    );
-                } else {
-                    self.send_event("terminated".to_string(), None);
-                }
-            }
-        }
+        // Event polling now happens in main loop
     }
 
     pub fn handle_pause(&mut self, seq: u64, command: String) {
-        // Set the mode to StepInto so it stops at the next line
         if let Some(ctx_arc) = &self.context {
             if let Ok(mut ctx) = ctx_arc.lock() {
                 ctx.set_mode(RunMode::StepInto);
-                // Don't set continue_requested = true, leave it false
-                // This will make the execution thread stop at the next line
             }
         }
 
         self.send_response(seq, command, true, None);
 
-        // Send a stopped event
         self.send_event(
             "stopped".to_string(),
             Some(json!({

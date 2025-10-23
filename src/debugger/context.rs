@@ -138,7 +138,7 @@ impl DebugContext {
             return;
         }
 
-        let mut rest = l[3..].trim_start();
+        let rest = l[3..].trim_start();
 
         // Handle /A (arithmetic) - we can't track these accurately without executing
         if rest.to_uppercase().starts_with("/A") {

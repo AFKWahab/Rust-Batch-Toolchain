@@ -1,8 +1,11 @@
 mod protocol;
 mod server;
 
+use serde_json::json;
 use std::fs;
 use std::io::{self, Write};
+use std::thread;
+use std::time::Duration;
 
 pub use protocol::DapMessageContent;
 pub use server::DapServer;
@@ -24,14 +27,45 @@ pub fn run_dap_mode() -> io::Result<()> {
     let mut msg_count = 0;
 
     loop {
-        msg_count += 1;
+        // CRITICAL: Poll for output from execution thread
+        server.check_and_send_output();
 
-        if let Some(ref mut f) = log {
-            writeln!(f, "Waiting for message #{}...", msg_count).ok();
-            f.flush().ok();
+        // CRITICAL: Poll for stopped events from execution thread
+        // Collect events first, then process them to avoid borrow checker issues
+        let mut events = Vec::new();
+        if let Some(ref rx) = server.event_receiver {
+            while let Ok((reason, line)) = rx.try_recv() {
+                events.push((reason, line));
+            }
         }
 
-        if let Some(msg) = server.read_message() {
+        // Now process the events
+        for (reason, _line) in events {
+            if let Some(ref mut f) = log {
+                writeln!(f, "📥 Event received: {}", reason).ok();
+                f.flush().ok();
+            }
+
+            if reason != "terminated" {
+                server.send_event(
+                    "stopped".to_string(),
+                    Some(json!({
+                        "reason": reason,
+                        "threadId": 1,
+                        "allThreadsStopped": true
+                    })),
+                );
+                eprintln!("📤 Sent stopped event: {}", reason);
+            } else {
+                eprintln!("📤 Sending terminated event");
+                server.send_event("terminated".to_string(), None);
+            }
+        }
+
+        // Try to read a DAP message (non-blocking)
+        if let Some(msg) = server.try_read_message() {
+            msg_count += 1;
+
             if let Some(ref mut f) = log {
                 writeln!(f, "✓ Received message #{}: {:?}", msg_count, msg.content).ok();
                 f.flush().ok();
@@ -102,12 +136,10 @@ pub fn run_dap_mode() -> io::Result<()> {
                     eprintln!("📬 Non-request message");
                 }
             }
-        } else {
-            if let Some(ref mut f) = log {
-                writeln!(f, "✗ No message received").ok();
-                f.flush().ok();
-            }
         }
+
+        // Small sleep to prevent busy-waiting
+        thread::sleep(Duration::from_millis(10));
     }
 
     if let Some(ref mut f) = log {
